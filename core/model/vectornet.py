@@ -33,12 +33,12 @@ class VectorNet(nn.Module):
 
     def __init__(self,
                  in_channels=8,
-                 horizon=30,
+                 horizon=50,
                  num_subgraph_layers=3,
-                 num_global_graph_layer=1,
-                 subgraph_width=64,
-                 global_graph_width=64,
-                 traj_pred_mlp_width=64,
+                 num_global_graph_layer=3,
+                 subgraph_width=128,
+                 global_graph_width=256,
+                 traj_pred_mlp_width=128,
                  with_aux: bool = False,
                  device=torch.device("cpu")):
         super(VectorNet, self).__init__()
@@ -75,16 +75,16 @@ class VectorNet(nn.Module):
             data (Data): [x, y, cluster, edge_index, valid_len]
         """
         global_feat, aux_out, aux_gt = self.backbone(data)              # [batch_size, time_step_len, global_graph_width]
-        target_feat = global_feat[:, 0]
+        target_feat = global_feat[:, 0] # batch_size，global_graph_width
 
-        pred = self.traj_pred_mlp(target_feat)
+        pred = self.traj_pred_mlp(target_feat) # ->batch_size, 50*2
 
         return {"pred": pred, "aux_out": aux_out, "aux_gt":aux_gt}
 
     def inference(self, data):
         batch_size = data.num_graphs
 
-        pred_traj = self.forward(data)["pred"].view((batch_size, self.k, self.horizon, 2)).cumsum(2)
+        pred_traj = self.forward(data)["pred"].view((batch_size, self.k, self.horizon, 2)).cumsum(2) # batch_size, 50*2 ->  bs,1,50,2
 
         return pred_traj
 
@@ -224,7 +224,7 @@ class OriginalVectorNet(nn.Module):
 
     def __init__(self,
                  in_channels=8,
-                 pred_len=30,
+                 pred_len=50,
                  num_subgraph_layres=3,
                  num_global_graph_layer=1,
                  subgraph_width=64,
@@ -318,7 +318,7 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     batch_size = 2
 
-    in_channels, pred_len = 10, 30
+    in_channels, pred_len = 10, 50
     show_every = 10
     os.chdir('..')
     # get model

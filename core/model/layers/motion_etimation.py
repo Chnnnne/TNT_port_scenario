@@ -9,8 +9,8 @@ from core.model.layers.basic_module import MLP
 class MotionEstimation(nn.Module):
     def __init__(self,
                  in_channels,
-                 horizon=30,
-                 hidden_dim=64):
+                 horizon=50,
+                 hidden_dim=128):
         """
         estimate the trajectories based on the predicted targets
         :param in_channels:
@@ -53,9 +53,9 @@ class MotionEstimation(nn.Module):
             input = torch.cat([feat_in.repeat(1, M, 1), loc_in], dim=2)
         else:
             # targt ground truth
-            input = torch.cat([feat_in, loc_in], dim=-1)
+            input = torch.cat([feat_in, loc_in], dim=-1) # [bs,1,D+2]
 
-        return self.traj_pred(input)
+        return self.traj_pred(input) # ->[bs,1,horizon*2]
 
     def loss(self, feat_in: torch.Tensor, loc_gt: torch.Tensor, traj_gt: torch.Tensor):
         """

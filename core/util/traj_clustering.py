@@ -21,7 +21,7 @@ class ArgoversePreprocessor(Dataset):
     def __init__(self,
                  root_dir,
                  obs_horizon=20,
-                 pred_horizon=30,
+                 pred_horizon=50,
                  split="train"):
 
         self.obs_horizon = obs_horizon

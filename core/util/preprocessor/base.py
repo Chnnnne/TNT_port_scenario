@@ -137,6 +137,7 @@ class Preprocessor(Dataset):
             plt.axis("off")
             plt.title("No. of lane candidates = {}; No. of target candidates = {};".format(len(centerline_list), len(candidates)))
             plt.show()
+            plt.savefig('my_fig1.png')
 
         return candidates
 
@@ -147,13 +148,13 @@ class Preprocessor(Dataset):
         :param target_candidate, (N, 2) candidates
         :param gt_target, (1, 2) the coordinate of final target
         """
-        displacement = gt_target - target_candidate
-        gt_index = np.argmin(np.power(displacement[:, 0], 2) + np.power(displacement[:, 1], 2))
+        displacement = gt_target - target_candidate # N,2
+        gt_index = np.argmin(np.power(displacement[:, 0], 2) + np.power(displacement[:, 1], 2)) # 
 
-        onehot = np.zeros((target_candidate.shape[0], 1))
-        onehot[gt_index] = 1
+        onehot = np.zeros((target_candidate.shape[0], 1))  # n,1
+        onehot[gt_index] = 1 # n,1
 
-        offset_xy = gt_target - target_candidate[gt_index]
+        offset_xy = gt_target - target_candidate[gt_index] # 2,
         return onehot, offset_xy
 
     @staticmethod

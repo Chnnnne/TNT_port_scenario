@@ -12,6 +12,7 @@ from core.dataloader.dataset import GraphDataset
 # from core.dataloader.argoverse_loader import Argoverse, GraphData, ArgoverseInMem
 from core.dataloader.argoverse_loader_v2 import GraphData, ArgoverseInMem
 from core.trainer.tnt_trainer import TNTTrainer
+from core.trainer.vectornet_trainer import VectorNetTrainer
 import random
 sys.path.append("core/dataloader")
 
@@ -38,20 +39,33 @@ def test(args):
         raise Exception("Failed to load the data, please check the dataset!")
 
     # init trainer
-    trainer = TNTTrainer(
+    trainer = VectorNetTrainer(
         trainset=test_set,
         evalset=test_set,
         testset=test_set,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         aux_loss=True,
-        enable_log=False,
         with_cuda=args.with_cuda,
         cuda_device=args.cuda_device,
         save_folder=output_dir,
         ckpt_path=args.resume_checkpoint if hasattr(args, "resume_checkpoint") and args.resume_checkpoint else None,
         model_path=args.resume_model if hasattr(args, "resume_model") and args.resume_model else None
     )
+    # trainer = TNTTrainer(
+    #     trainset=test_set,
+    #     evalset=test_set,
+    #     testset=test_set,
+    #     batch_size=args.batch_size,
+    #     num_workers=args.num_workers,
+    #     aux_loss=True,
+    #     enable_log=False,
+    #     with_cuda=args.with_cuda,
+    #     cuda_device=args.cuda_device,
+    #     save_folder=output_dir,
+    #     ckpt_path=args.resume_checkpoint if hasattr(args, "resume_checkpoint") and args.resume_checkpoint else None,
+    #     model_path=args.resume_model if hasattr(args, "resume_model") and args.resume_model else None
+    # )
 
     # trainer.test(miss_threshold=2.0, save_pred=True, convert_coordinate=True)
     trainer.test_latency()

@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.optim import Adam, AdamW
 from torch_geometric.data import DataLoader
 from torch_geometric.nn import DataParallel
+import time
 from argoverse.evaluation.eval_forecasting import get_displacement_errors_and_miss_rate
 from argoverse.evaluation.competition_util import generate_forecasting_h5
 
@@ -19,6 +20,18 @@ from core.trainer.trainer import Trainer
 from core.model.vectornet import VectorNet, OriginalVectorNet
 from core.optim_schedule import ScheduledOptim
 from core.loss import VectorLoss
+def count_parameters(model):
+    """
+    Given a PyTorch model, count all parameters
+    """
+    return sum(p.numel() for p in model.parameters())
+
+
+def count_trainable_parameters(model):
+    """
+    Given a PyTorch model, count only trainable parameters
+    """
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 class VectorNetTrainer(Trainer):
@@ -32,7 +45,7 @@ class VectorNetTrainer(Trainer):
                  batch_size: int = 1,
                  num_workers: int = 1,
                  num_global_graph_layer=1,
-                 horizon: int = 30,
+                 horizon: int = 50,
                  lr: float = 1e-3,
                  betas=(0.9, 0.999),
                  weight_decay: float = 0.01,
@@ -97,6 +110,13 @@ class VectorNetTrainer(Trainer):
             with_aux=aux_loss,
             device=self.device
         )
+        print(f"Model {model_name} is ready!")
+        print("Total number of parameters:", count_parameters(self.model))
+        print("Number of trainable parameters:", count_trainable_parameters(self.model))
+        print(f'Number of trainable parameters:{count_trainable_parameters(self.model)/(1024*1024):.2f}M')
+        print(f"Number of non-trainable parameters: "
+            f"{count_parameters(self.model) - count_trainable_parameters(self.model)}\n")
+
         self.criterion = VectorLoss(aux_loss=aux_loss, reduction="sum")
 
         # init optimizer
@@ -191,9 +211,41 @@ class VectorNetTrainer(Trainer):
 
     def compute_loss(self, data):
         out = self.model(data)
-        y = data.y.view(-1, self.horizon * 2)
+        y = data.y.view(-1, self.horizon * 2) # [bs,30*2]
         return self.criterion(out["pred"], y, out["aux_out"], out["aux_gt"])
 
     # todo: the inference of the model
     def test(self, data):
         raise NotImplementedError
+    
+    def test_latency(self):
+        """
+        test the testset,
+        :param miss_threshold: float, the threshold for the miss rate, default 2.0m
+        :param compute_metric: bool, whether compute the metric
+        :param convert_coordinate: bool, True: under original coordinate, False: under the relative coordinate
+        :param save_pred: store the prediction or not, store in the Argoverse benchmark format
+        """
+        self.model.eval()
+
+
+        horizon = self.model.horizon
+
+        with torch.no_grad():
+            print(len(self.test_loader))
+            # print(len(self.test_dataset))
+            times = torch.zeros(len(self.test_loader))
+            for idx, data in tqdm(enumerate(self.test_loader)):
+                # inference and transform dimension
+                if self.multi_gpu:
+                    out = self.model.module(data.to(self.device))
+                    # out = self.model.inference(data.to(self.device))
+                else:
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter()
+                    out = self.model.inference(data.to(self.device))
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter()
+                    times[idx] = end_time - start_time
+        print(times)
+        print(times.mean(-1))

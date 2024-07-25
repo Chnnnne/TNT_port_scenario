@@ -74,9 +74,9 @@ def train(gpu, args):
             min_eval_loss = eval_loss
 
             trainer.save(iter_epoch, min_eval_loss)
-            trainer.save_model("best")
+            trainer.save_model("tnt",iter_epoch, "best")
 
-    trainer.save_model("final")
+    trainer.save_model("final", "final")
 
 
 if __name__ == "__main__":
@@ -87,12 +87,12 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output_dir", required=False, type=str, default="run/tnt/",
                         help="ex)dir to save checkpoint and model")
 
-    parser.add_argument("-l", "--num_glayer", type=int, default=1,
+    parser.add_argument("-l", "--num_glayer", type=int, default=4,
                         help="number of global graph layers")
     parser.add_argument("-a", "--aux_loss", action="store_true", default=True,
                         help="Training with the auxiliary recovery loss")
 
-    parser.add_argument("-b", "--batch_size", type=int, default=2,
+    parser.add_argument("-b", "--batch_size", type=int, default=32,
                         help="number of batch_size")
     parser.add_argument("-e", "--n_epoch", type=int, default=50,
                         help="number of epochs")

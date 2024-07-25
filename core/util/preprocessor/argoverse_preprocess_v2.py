@@ -25,6 +25,7 @@ from argoverse.utils.mpl_plotting_utils import visualize_centerline
 
 from core.util.preprocessor.base import Preprocessor
 from core.util.cubic_spline import Spline2D
+import core.util.my_utils as my_utils
 
 warnings.filterwarnings("ignore")
 
@@ -38,7 +39,7 @@ class ArgoversePreprocessor(Preprocessor):
                  algo="tnt",
                  obs_horizon=20,
                  obs_range=100,
-                 pred_horizon=30,
+                 pred_horizon=50,
                  normalized=True,
                  save_dir=None):
         super(ArgoversePreprocessor, self).__init__(root_dir, algo, obs_horizon, obs_range, pred_horizon)
@@ -50,7 +51,7 @@ class ArgoversePreprocessor(Preprocessor):
         self.normalized = normalized
 
         self.am = ArgoverseMap()
-        self.loader = ArgoverseForecastingLoader(pjoin(self.root_dir, self.split+"_obs" if split == "test" else split))
+        self.loader = ArgoverseForecastingLoader(pjoin(self.root_dir, self.split+"_obs" if split == "test" else split, "data"))
 
         self.save_dir = save_dir
 
@@ -64,6 +65,7 @@ class ArgoversePreprocessor(Preprocessor):
         return self.process_and_save(df, seq_id=seq_f_name, dir_=self.save_dir)
 
     def process(self, dataframe: pd.DataFrame,  seq_id, map_feat=True):
+        print(seq_id)
         data = self.read_argo_data(dataframe)
         data = self.get_obj_feats(data)
 
@@ -85,26 +87,26 @@ class ArgoversePreprocessor(Preprocessor):
 
         """TIMESTAMP,TRACK_ID,OBJECT_TYPE,X,Y,CITY_NAME"""
         agt_ts = np.sort(np.unique(df['TIMESTAMP'].values))
-        mapping = dict()
+        mapping = dict() # 给每个unique时间按顺序排序号
         for i, ts in enumerate(agt_ts):
             mapping[ts] = i
 
         trajs = np.concatenate((
             df.X.to_numpy().reshape(-1, 1),
-            df.Y.to_numpy().reshape(-1, 1)), 1)
+            df.Y.to_numpy().reshape(-1, 1)), 1)  # csv_len, 2 (对应csv n行)
 
-        steps = [mapping[x] for x in df['TIMESTAMP'].values]
-        steps = np.asarray(steps, np.int64)
+        steps = [mapping[x] for x in df['TIMESTAMP'].values] # 给csv中每个时间戳分配序号（步idx），相同时间戳对应的步idx相同 []
+        steps = np.asarray(steps, np.int64) # csv_len [0,0,0, 1, 1,1,2,2,2,]
 
-        objs = df.groupby(['TRACK_ID', 'OBJECT_TYPE']).groups
-        keys = list(objs.keys())
-        obj_type = [x[1] for x in keys]
+        objs = df.groupby(['TRACK_ID', 'OBJECT_TYPE']).groups # dict   key=track_id,obj_type  val=csv_idc_list
+        keys = list(objs.keys()) # dict.keys -> list
+        obj_type = [x[1] for x in keys] # list -> obj type
 
-        agt_idx = obj_type.index('AGENT')
-        idcs = objs[keys[agt_idx]]
+        agt_idx = obj_type.index('AGENT') # agent in keys list idx
+        idcs = objs[keys[agt_idx]] # agent对应在csv中的行idcs    agt_idx + keys -> key name -> dict -> get agt idcs
 
-        agt_traj = trajs[idcs]
-        agt_step = steps[idcs]
+        agt_traj = trajs[idcs] # (agent_len, 2)
+        agt_step = steps[idcs] # (agent_len,) 
 
         del keys[agt_idx]
         ctx_trajs, ctx_steps = [], []
@@ -115,23 +117,25 @@ class ArgoversePreprocessor(Preprocessor):
 
         data = dict()
         data['city'] = city
-        data['trajs'] = [agt_traj] + ctx_trajs
-        data['steps'] = [agt_step] + ctx_steps
+        data['trajs'] = [agt_traj] + ctx_trajs # [all_obj_num, one_agent_csv_len, 2] 绝对坐标系下所有object的轨迹信息， 
+        data['steps'] = [agt_step] + ctx_steps # [all_obs_num, one_agent_csv_steps] object的轨迹对应的50帧的哪些帧
         return data
 
     def get_obj_feats(self, data):
         # get the origin and compute the oritentation of the target agent
-        orig = data['trajs'][0][self.obs_horizon-1].copy().astype(np.float32)
+        # traj (obj_num, one_obj_csv_len50or20, 2)
+
+        orig = data['trajs'][0][self.obs_horizon-1].copy().astype(np.float32)# [all_obj, one_agt_csvlen, 2] -> 2
 
         # comput the rotation matrix
         if self.normalized:
-            pre, conf = self.am.get_lane_direction(data['trajs'][0][self.obs_horizon-1], data['city'])
+            pre, conf = self.am.get_lane_direction(data['trajs'][0][self.obs_horizon-1], data['city']) # 2<-all_obj, one_agt_csvlen,2,  agent在obs处位置来获得lane direction
             if conf <= 0.1:
                 pre = (orig - data['trajs'][0][self.obs_horizon-4]) / 2.0
-            theta = - np.arctan2(pre[1], pre[0]) + np.pi / 2
+            theta = - np.arctan2(pre[1], pre[0]) + np.pi / 2 # agent obs处的车道朝向角
             rot = np.asarray([
                 [np.cos(theta), -np.sin(theta)],
-                [np.sin(theta), np.cos(theta)]], np.float32)
+                [np.sin(theta), np.cos(theta)]], np.float32) # [2,2]
         else:
             # if not normalized, do not rotate.
             theta = None
@@ -140,23 +144,28 @@ class ArgoversePreprocessor(Preprocessor):
                 [0.0, 1.0]], np.float32)
 
         # get the target candidates and candidate gt
-        agt_traj_obs = data['trajs'][0][0: self.obs_horizon].copy().astype(np.float32)
-        agt_traj_fut = data['trajs'][0][self.obs_horizon:self.obs_horizon+self.pred_horizon].copy().astype(np.float32)
-        ctr_line_candts = self.am.get_candidate_centerlines_for_traj(agt_traj_obs, data['city'], viz=False)
-
+        agt_traj_obs = data['trajs'][0][0: self.obs_horizon].copy().astype(np.float32) # [20,2] agent obs traj
+        agt_traj_fut = data['trajs'][0][self.obs_horizon:self.obs_horizon+self.pred_horizon].copy().astype(np.float32) # [30,2] agent fut traj
+        ctr_line_candts = self.am.get_candidate_centerlines_for_traj(agt_traj_obs, data['city'], viz=True)  # [(30,2), (50,2)] 以agent_obs_traj所找到的附近的候选参考车道centerlines ：  list(candiadate_lane_num, one line point num， 2)
         # rotate the center lines and find the reference center line
-        agt_traj_fut = np.matmul(rot, (agt_traj_fut - orig.reshape(-1, 2)).T).T
+        agt_traj_fut = np.matmul(rot, (agt_traj_fut - orig.reshape(-1, 2)).T).T # [30,2] 对fut30个坐标点进行转换以target agent自车obs处为坐标系原点，lane方向为新坐标系y轴方向，
         for i, _ in enumerate(ctr_line_candts):
-            ctr_line_candts[i] = np.matmul(rot, (ctr_line_candts[i] - orig.reshape(-1, 2)).T).T
+            ctr_line_candts[i] = np.matmul(rot, (ctr_line_candts[i] - orig.reshape(-1, 2)).T).T# 对所有cand_center_line做同样的坐标系转换
 
-        tar_candts = self.lane_candidate_sampling(ctr_line_candts, [0, 0], viz=False)
+        tar_candts = self.lane_candidate_sampling(ctr_line_candts, [0, 0], viz=True) # [all_cand_point,2]  对候选车道线ctr_line_candts进行等距采样点得到tar_candts (493,2)
 
         if self.split == "test":
             tar_candts_gt, tar_offse_gt = np.zeros((tar_candts.shape[0], 1)), np.zeros((1, 2))
             splines, ref_idx = None, None
         else:
-            splines, ref_idx = self.get_ref_centerline(ctr_line_candts, agt_traj_fut)
-            tar_candts_gt, tar_offse_gt = self.get_candidate_gt(tar_candts, agt_traj_fut[-1])
+            splines, ref_idx = self.get_ref_centerline(ctr_line_candts, agt_traj_fut) # list[spline2D], [1, ]根据agent未来真实traj来寻找真实的gt和ref line
+            tar_candts_gt, tar_offse_gt = self.get_candidate_gt(tar_candts, agt_traj_fut[-1]) #[all_cand_point,1] [2,] 
+            ''''''
+            agt_traj_obs_normal = np.matmul(rot, (agt_traj_obs - orig.reshape(-1, 2)).T).T
+            my_utils.draw_traj(agt_traj_obs_normal, text="obs")
+            my_utils.draw_traj(agt_traj_fut, text="fut")
+            # self.plot_my(ctr_line_candts, splines, ref_idx,agt_traj_obs_normal, agt_traj_fut, tar_candts, tar_candts_gt, tar_offse_gt)
+            ''''''
 
         # self.plot_target_candidates(ctr_line_candts, agt_traj_obs, agt_traj_fut, tar_candts)
         # if not np.all(offse_gt < self.LANE_WIDTH[data['city']]):
@@ -164,29 +173,30 @@ class ArgoversePreprocessor(Preprocessor):
 
         feats, ctrs, has_obss, gt_preds, has_preds = [], [], [], [], []
         x_min, x_max, y_min, y_max = -self.obs_range, self.obs_range, -self.obs_range, self.obs_range
-        for traj, step in zip(data['trajs'], data['steps']):
+        for traj, step in zip(data['trajs'], data['steps']): #第一个是agent [all_obj_num, one_agent_csv_len50or20, 2] [all_agent_num, one_aent_csv_steps]
             if self.obs_horizon-1 not in step:
                 continue
 
             # normalize and rotate
-            traj_nd = np.matmul(rot, (traj - orig.reshape(-1, 2)).T).T
+            traj_nd = np.matmul(rot, (traj - orig.reshape(-1, 2)).T).T # [obj_len, 2] 将obj所有帧数据转化到agent坐标系下
 
             # collect the future prediction ground truth
-            gt_pred = np.zeros((self.pred_horizon, 2), np.float32)
-            has_pred = np.zeros(self.pred_horizon, np.bool)
-            future_mask = np.logical_and(step >= self.obs_horizon, step < self.obs_horizon + self.pred_horizon)
-            post_step = step[future_mask] - self.obs_horizon
-            post_traj = traj_nd[future_mask]
-            gt_pred[post_step] = post_traj
-            has_pred[post_step] = True
+            # 根据帧数
+            gt_pred = np.zeros((self.pred_horizon, 2), np.float32) # [30,2] 该object后续30帧的真实轨迹
+            has_pred = np.zeros(self.pred_horizon, np.bool) # [30] # 标志30帧中的有效帧
+            future_mask = np.logical_and(step >= self.obs_horizon, step < self.obs_horizon + self.pred_horizon) # [n]-> [v]个有效
+            post_step = step[future_mask] - self.obs_horizon # [v] 剩余的有效步数重定位
+            post_traj = traj_nd[future_mask] # [v,2]
+            gt_pred[post_step] = post_traj # [30,2] 
+            has_pred[post_step] = True # [30]
 
-            # colect the observation
-            obs_mask = step < self.obs_horizon
-            step_obs = step[obs_mask]
-            traj_obs = traj_nd[obs_mask]
-            idcs = step_obs.argsort()
-            step_obs = step_obs[idcs]
-            traj_obs = traj_obs[idcs]
+            # colect the observation    先将该agent对应的step判断一下是否在obs——horizon以内，然后获取这些step和对应的traj。然后对step重定位
+            obs_mask = step < self.obs_horizon # obj小于20的那些step mask住  
+            step_obs = step[obs_mask] # 得到小于20的步数 [10,11,12,13,14,15,16,17,18,19]
+            traj_obs = traj_nd[obs_mask] #得到小于20的轨迹[1123.941,...]
+            idcs = step_obs.argsort() # step重定位 [0123456789]
+            step_obs = step_obs[idcs] # 得到obslen内的step [10,11,12,13,14,15,16,17,18,19]
+            traj_obs = traj_obs[idcs] # 20,2
 
             for i in range(len(step_obs)):
                 if step_obs[i] == self.obs_horizon - len(step_obs) + i:
@@ -197,8 +207,8 @@ class ArgoversePreprocessor(Preprocessor):
             if len(step_obs) <= 1:
                 continue
 
-            feat = np.zeros((self.obs_horizon, 3), np.float32)
-            has_obs = np.zeros(self.obs_horizon, np.bool)
+            feat = np.zeros((self.obs_horizon, 3), np.float32) # [20,3]
+            has_obs = np.zeros(self.obs_horizon, np.bool) # [20]
 
             feat[step_obs, :2] = traj_obs
             feat[step_obs, 2] = 1.0
@@ -215,10 +225,10 @@ class ArgoversePreprocessor(Preprocessor):
         # if len(feats) < 1:
         #     raise Exception()
 
-        feats = np.asarray(feats, np.float32)
-        has_obss = np.asarray(has_obss, np.bool)
-        gt_preds = np.asarray(gt_preds, np.float32)
-        has_preds = np.asarray(has_preds, np.bool)
+        feats = np.asarray(feats, np.float32)  # [object_num,20,3] obs轨迹  若只有3,4,5,6...19.则 012为0
+        has_obss = np.asarray(has_obss, np.bool) # # [object_num, 20]  标志20帧中的有效帧
+        gt_preds = np.asarray(gt_preds, np.float32) #[object_num,50,2] 该object后续30帧的真实轨迹
+        has_preds = np.asarray(has_preds, np.bool) #[object_num,50] 标志30帧中的有效帧
 
         # plot the splines
         # self.plot_reference_centerlines(ctr_line_candts, splines, feats[0], gt_preds[0], ref_idx)
@@ -229,20 +239,20 @@ class ArgoversePreprocessor(Preprocessor):
         # if not np.any(candts_gt[inlier]):
         #     raise Exception("The gt of target candidate exceeds the observation range!")
 
-        data['orig'] = orig
-        data['theta'] = theta
-        data['rot'] = rot
+        data['orig'] = orig # obs坐标点
+        data['theta'] = theta # agent obs处的车道朝向角
+        data['rot'] = rot # agent 2,2
 
-        data['feats'] = feats
-        data['has_obss'] = has_obss
+        data['feats'] = feats # # [object_num,20,3] x,y,mask      agent坐标系
+        data['has_obss'] = has_obss # [object_num, 20]  标志20帧中的有效帧 （靠后的位置填满，不同于simpl）
 
-        data['has_preds'] = has_preds
-        data['gt_preds'] = gt_preds
-        data['tar_candts'] = tar_candts
-        data['gt_candts'] = tar_candts_gt
-        data['gt_tar_offset'] = tar_offse_gt
-
-        data['ref_ctr_lines'] = splines         # the reference candidate centerlines Spline for prediction
+        data['has_preds'] = has_preds #[object_num,30] 标志30帧中的有效帧
+        data['gt_preds'] = gt_preds # [object_num,30,2] 该object后续30帧的真实轨迹     agent坐标系
+        data['tar_candts'] = tar_candts # [cand_n, 2] agent坐标系
+        data['gt_candts'] = tar_candts_gt # [cand,1] agent坐标系
+        data['gt_tar_offset'] = tar_offse_gt # [2，] 采样点加偏移得到真实轨迹点GT
+        # 根据agent未来真实traj来寻找真实的gt和ref line
+        data['ref_ctr_lines'] = splines #list (len=candiadate_lane_num), (item=spline) agent坐标系，the reference candidate centerlines Spline for prediction  
         data['ref_cetr_idx'] = ref_idx          # the idx of the closest reference centerlines
         return data
 
@@ -254,12 +264,12 @@ class ArgoversePreprocessor(Preprocessor):
         lane_ids = copy.deepcopy(lane_ids)
 
         lanes = dict()
-        for lane_id in lane_ids:
+        for lane_id in lane_ids:# 将感兴趣的每条lane的centerline和polygon都变化坐标系存入lane中，得到lanes_dict
             lane = self.am.city_lane_centerlines_dict[data['city']][lane_id]
             lane = copy.deepcopy(lane)
 
-            centerline = np.matmul(data['rot'], (lane.centerline - data['orig'].reshape(-1, 2)).T).T
-            x, y = centerline[:, 0], centerline[:, 1]
+            centerline = np.matmul(data['rot'], (lane.centerline - data['orig'].reshape(-1, 2)).T).T # 将lane也转化到以orig的坐标系
+            x, y = centerline[:, 0], centerline[:, 1] # 该center lane是否和obs range有交叉
             if x.max() < x_min or x.min() > x_max or y.max() < y_min or y.min() > y_max:
                 continue
             else:
@@ -272,25 +282,25 @@ class ArgoversePreprocessor(Preprocessor):
 
         lane_ids = list(lanes.keys())
         ctrs, feats, turn, control, intersect = [], [], [], [], []
-        for lane_id in lane_ids:
+        for lane_id in lane_ids:  # 遍历lane_dict
             lane = lanes[lane_id]
-            ctrln = lane.centerline
-            num_segs = len(ctrln) - 1
+            ctrln = lane.centerline # [10,2]
+            num_segs = len(ctrln) - 1 # 9
 
-            ctrs.append(np.asarray((ctrln[:-1] + ctrln[1:]) / 2.0, np.float32))
-            feats.append(np.asarray(ctrln[1:] - ctrln[:-1], np.float32))
+            ctrs.append(np.asarray((ctrln[:-1] + ctrln[1:]) / 2.0, np.float32)) # [9,2]
+            feats.append(np.asarray(ctrln[1:] - ctrln[:-1], np.float32)) # [9, 2]
 
-            x = np.zeros((num_segs, 2), np.float32)
+            x = np.zeros((num_segs, 2), np.float32) # [9,2]
             if lane.turn_direction == 'LEFT':
                 x[:, 0] = 1
             elif lane.turn_direction == 'RIGHT':
                 x[:, 1] = 1
             else:
                 pass
-            turn.append(x)
+            turn.append(x) # [9,2]
 
-            control.append(lane.has_traffic_control * np.ones(num_segs, np.float32))
-            intersect.append(lane.is_intersection * np.ones(num_segs, np.float32))
+            control.append(lane.has_traffic_control * np.ones(num_segs, np.float32)) # [9,]
+            intersect.append(lane.is_intersection * np.ones(num_segs, np.float32)) # [9,]
 
         lane_idcs = []
         count = 0
@@ -301,13 +311,15 @@ class ArgoversePreprocessor(Preprocessor):
         lane_idcs = np.concatenate(lane_idcs, 0)
 
         graph = dict()
-        graph['ctrs'] = np.concatenate(ctrs, 0)
-        graph['num_nodes'] = num_nodes
-        graph['feats'] = np.concatenate(feats, 0)
-        graph['turn'] = np.concatenate(turn, 0)
-        graph['control'] = np.concatenate(control, 0)
-        graph['intersect'] = np.concatenate(intersect, 0)
-        graph['lane_idcs'] = lane_idcs
+        graph['ctrs'] = np.concatenate(ctrs, 0) # [all_lane_num*9, 2] <- ctrs list[(9,2),(9,2)]
+        graph['num_nodes'] = num_nodes # all_lane_num*9 一条lane采了9个点
+        graph['feats'] = np.concatenate(feats, 0) # [all_lane_num*9,2] 每条lane的每个seg的方向向量 
+
+        graph['turn'] = np.concatenate(turn, 0)  # （all_lane_num*9,2） 每条lane的每个seg的转向标志
+        graph['control'] = np.concatenate(control, 0)# 每个seg的has_traffic_control（all_lane_num*9)
+        graph['intersect'] = np.concatenate(intersect, 0) # 每个seg的is_intersection（all_lane_num*9)
+        
+        graph['lane_idcs'] = lane_idcs # 表示属于哪个lane  [(0,0,0,0,0,...)(1,1,1,1,..),(2,2,2,2,2,2),..] len=all_lane_num
 
         return graph
 
@@ -355,13 +367,75 @@ class ArgoversePreprocessor(Preprocessor):
 
             # search the closest point of the traj final position to each center line
             min_distances = []
-            for line in ref_centerlines:
-                xy = np.stack([line.x_fine, line.y_fine], axis=1)
-                diff = xy - pred_gt[-1, :2]
-                dis = np.hypot(diff[:, 0], diff[:, 1])
-                min_distances.append(np.min(dis))
-            line_idx = np.argmin(min_distances)
+            for line in ref_centerlines: # TODO 不太合理的找ref 方式
+                xy = np.stack([line.x_fine, line.y_fine], axis=1)# n,2
+                diff = xy - pred_gt[-1, :2]# n,2
+                dis = np.hypot(diff[:, 0], diff[:, 1]) # n,2->n
+                min_distances.append(np.min(dis)) # n->1
+            line_idx = np.argmin(min_distances)# n-> 1
             return ref_centerlines, line_idx
+        
+    def plot_my(self, cline_list, splines, ref_line_idx,agent_obs_xy,agent_fut_xy, tar_candts, tar_candts_gt, tar_offse_gt):
+        fig,axes = plt.subplots(1,2, figsize=(10, 10),dpi=1000)
+        # fig.clear()
+
+        for centerline_coords in cline_list:#绘制
+            visualize_centerline(centerline_coords,axes[0])
+        
+        # agent obs horizon 紫色实线绘制
+        axes[0].plot(
+            agent_obs_xy[:, 0],
+            agent_obs_xy[:, 1],
+            "-",
+            color="purple",
+            alpha=1,
+            linewidth=1,
+            zorder=15,
+        )
+
+        final_x = agent_obs_xy[-1, 0]
+        final_y = agent_obs_xy[-1, 1]
+        axes[0].plot(final_x, final_y, "o", color="#d33e4c", alpha=1, markersize=7, zorder=15)
+
+
+
+
+
+
+        # canadiate 参考线绘制，选中的是红虚线未选中是蓝虚线
+        for i, spline in enumerate(splines):
+            xy = np.stack([spline.x_fine, spline.y_fine], axis=1)
+            if i == ref_line_idx:
+                axes[1].plot(xy[:, 0], xy[:, 1], "--", color="r", alpha=0.7, linewidth=1, zorder=10)
+            else:
+                axes[1].plot(xy[:, 0], xy[:, 1], "--", color="b", alpha=0.5, linewidth=1, zorder=10) 
+
+
+
+        gt_point = tar_candts[np.where(tar_candts_gt == 1)[0]][0]
+        axes[1].plot(gt_point[0]+tar_offse_gt[0], gt_point[1]+tar_offse_gt[1], "x", color="#d33e4c", alpha=1, markersize=12, zorder=15)
+
+        axes[1].plot(
+            agent_fut_xy[:, 0],
+            agent_fut_xy[:, 1],
+            "-",
+            color="purple",
+            alpha=1,
+            linewidth=1,
+            zorder=15,
+        )
+
+        start_x = agent_fut_xy[0, 0]
+        start_y = agent_fut_xy[0, 1]
+        axes[1].plot(start_x, start_y, "o", color="#d33e4c", alpha=1, markersize=7, zorder=15)
+    
+        axes[0].set_xlabel("Map X")
+        axes[0].set_ylabel("Map Y")
+        # axes[0].axis("off")
+        axes[1].set_xlabel("Map X")
+        axes[1].set_ylabel("Map Y")
+        # axes[1].axis("off")
+        fig.savefig("my_fig2_plot_reference_centerlines_1.png")
 
     def plot_reference_centerlines(self, cline_list, splines, obs, pred, ref_line_idx):
         fig = plt.figure(0, figsize=(8, 7))
@@ -421,12 +495,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # args.root = "/home/jb/projects/Code/trajectory-prediction/TNT-Trajectory-Predition/dataset"
-    raw_dir = os.path.join(args.root, "raw_data")
+    raw_dir = os.path.join(args.root, "")
     interm_dir = os.path.join(args.dest, "interm_data" if not args.small else "interm_data_small")
 
-    for split in ["train", "val", "test"]:
+    for split in ["train","val","test"]:
         # construct the preprocessor and dataloader
-        argoverse_processor = ArgoversePreprocessor(root_dir=raw_dir, split=split, save_dir=interm_dir)
+        argoverse_processor = ArgoversePreprocessor(root_dir=raw_dir, split=split, save_dir=interm_dir) # 继承自dataset
         loader = DataLoader(argoverse_processor,
                             batch_size=1 if sys.gettrace() else 16,     # 1 batch in debug mode
                             num_workers=0 if sys.gettrace() else 16,    # use only 0 worker in debug mode

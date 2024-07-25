@@ -1,0 +1,1 @@
+python3 train_tnt.py --data_root /private/wangchen/instance_model/instance_model_data_tnt_no_mask --output_dir run/tnt/ --aux_loss --batch_size 32 --with_cuda --lr 0.0010 --warmup_epoch 30 --lr_update_freq 10 --lr_decay_rate 0.1

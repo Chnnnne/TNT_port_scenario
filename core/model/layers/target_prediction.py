@@ -11,7 +11,7 @@ from core.model.layers.basic_module import MLP
 class TargetPred(nn.Module):
     def __init__(self,
                  in_channels: int,
-                 hidden_dim: int = 64,
+                 hidden_dim: int = 128,
                  m: int = 50,
                  device=torch.device("cpu")):
         """"""
@@ -33,7 +33,7 @@ class TargetPred(nn.Module):
         )
 
     def forward(self, feat_in: torch.Tensor, tar_candidate: torch.Tensor, candidate_mask=None):
-        """
+        """# (bs,1,feat_channels)+(bs, candate_point_num+padding num, 2)+(bs, candate_point_num+padding num)
         predict the target end position of the target agent from the target candidates
         :param feat_in:        the encoded trajectory features, [batch_size, inchannels]
         :param tar_candidate:  the target position candidate (x, y), [batch_size, N, 2]
@@ -43,18 +43,18 @@ class TargetPred(nn.Module):
         # dimension must be [batch size, 1, in_channels]
         assert feat_in.dim() == 3, "[TNT-TargetPred]: Error input feature dimension"
 
-        batch_size, n, _ = tar_candidate.size()
+        batch_size, n, _ = tar_candidate.size() # 4491 = candate_point_num+padding num
 
         # stack the target candidates to the end of input feature
-        feat_in_repeat = torch.cat([feat_in.repeat(1, n, 1), tar_candidate], dim=2)
+        feat_in_repeat = torch.cat([feat_in.repeat(1, n, 1), tar_candidate], dim=2) # (bs, candate_point_num+padding num, feat_channel +2)
 
         # compute probability for each candidate
-        prob_tensor = self.prob_mlp(feat_in_repeat).squeeze(2)
+        prob_tensor = self.prob_mlp(feat_in_repeat).squeeze(2)#(bs, 4491)
         if not isinstance(candidate_mask, torch.Tensor):
             tar_candit_prob = F.softmax(prob_tensor, dim=-1)                                    # [batch_size, n_tar]
         else:
-            tar_candit_prob = masked_softmax(prob_tensor, candidate_mask, dim=-1)               # [batch_size, n_tar]
-        tar_offset_mean = self.mean_mlp(feat_in_repeat)                                         # [batch_size, n_tar, 2]
+            tar_candit_prob = masked_softmax(prob_tensor, candidate_mask, dim=-1)               # [batch_size, n_tar](bs, 4491)
+        tar_offset_mean = self.mean_mlp(feat_in_repeat)                                         # [batch_size, n_tar, 2](bs, 4491,2)
 
         return tar_candit_prob, tar_offset_mean
 

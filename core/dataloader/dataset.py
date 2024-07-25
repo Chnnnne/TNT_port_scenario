@@ -13,7 +13,7 @@ import torch
 from core.util.config import DATA_DIR, LANE_RADIUS, OBJ_RADIUS, OBS_LEN, INTERMEDIATE_DATA_DIR
 from tqdm import tqdm
 
-PREDICT_HORIZON = 30
+PREDICT_HORIZON = 50
 
 
 def get_fc_edge_index(num_nodes, start=0):

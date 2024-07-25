@@ -37,7 +37,7 @@ def distance_metric(traj_candidate: torch.Tensor, traj_gt: torch.Tensor):
 class TrajScoreSelection(nn.Module):
     def __init__(self,
                  feat_channels,
-                 horizon=30,
+                 horizon=50,
                  hidden_dim=64,
                  temper=0.01,
                  device=torch.device("cpu")):

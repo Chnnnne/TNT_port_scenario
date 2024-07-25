@@ -1,4 +1,4 @@
-import os
+import os,time
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -11,14 +11,27 @@ from torch_geometric.nn import DataParallel
 from argoverse.evaluation.eval_forecasting import get_displacement_errors_and_miss_rate
 from argoverse.evaluation.competition_util import generate_forecasting_h5
 
-from apex import amp
-from apex.parallel import DistributedDataParallel
+# from apex import amp
+# from apex.parallel import DistributedDataParallel
 
 from core.trainer.trainer import Trainer
 from core.model.TNT import TNT
 from core.optim_schedule import ScheduledOptim
 from core.util.viz_utils import show_pred_and_gt
 from core.loss import TNTLoss
+
+def count_parameters(model):
+    """
+    Given a PyTorch model, count all parameters
+    """
+    return sum(p.numel() for p in model.parameters())
+
+
+def count_trainable_parameters(model):
+    """
+    Given a PyTorch model, count only trainable parameters
+    """
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 class TNTTrainer(Trainer):
@@ -31,8 +44,8 @@ class TNTTrainer(Trainer):
                  testset,
                  batch_size: int = 1,
                  num_workers: int = 1,
-                 num_global_graph_layer=1,
-                 horizon: int = 30,
+                 num_global_graph_layer=4,
+                 horizon: int = 50,
                  lr: float = 1e-3,
                  betas=(0.9, 0.999),
                  weight_decay: float = 0.01,
@@ -104,6 +117,13 @@ class TNTTrainer(Trainer):
             with_aux=aux_loss,
             device=self.device
         )
+        print(f"Model {model_name} is ready!")
+        print("Total number of parameters:", count_parameters(self.model))
+        print("Number of trainable parameters:", count_trainable_parameters(self.model))
+        print(f'Number of trainable parameters:{count_trainable_parameters(self.model)/(1024*1024):.2f}M')
+        print(f"Number of non-trainable parameters: "
+            f"{count_parameters(self.model) - count_trainable_parameters(self.model)}\n")
+        
         self.criterion = TNTLoss(
             self.lambda1, self.lambda2, self.lambda3,
             self.model.m, self.model.k, 0.01,
@@ -127,10 +147,11 @@ class TNTTrainer(Trainer):
 
         self.model = self.model.to(self.device)
         if self.multi_gpu:
-            self.model = DistributedDataParallel(self.model)
-            self.model, self.optimizer = amp.initialize(self.model, self.optim, opt_level="O0")
-            if self.verbose and (not self.multi_gpu or (self.multi_gpu and self.cuda_id == 1)):
-                print("[TNTTrainer]: Train the mode with multiple GPUs: {} GPUs.".format(int(os.environ['WORLD_SIZE'])))
+            pass
+            # self.model = DistributedDataParallel(self.model)
+            # self.model, self.optimizer = amp.initialize(self.model, self.optim, opt_level="O0")
+            # if self.verbose and (not self.multi_gpu or (self.multi_gpu and self.cuda_id == 1)):
+            #     print("[TNTTrainer]: Train the mode with multiple GPUs: {} GPUs.".format(int(os.environ['WORLD_SIZE'])))
         else:
             if self.verbose and (not self.multi_gpu or (self.multi_gpu and self.cuda_id == 1)):
                 print("[TNTTrainer]: Train the mode with single device on {}.".format(self.device))
@@ -169,8 +190,9 @@ class TNTTrainer(Trainer):
                 loss, loss_dict = self.compute_loss(data)
 
                 if self.multi_gpu:
-                    with amp.scale_loss(loss, self.optim) as scaled_loss:
-                        scaled_loss.backward()
+                    pass
+                    # with amp.scale_loss(loss, self.optim) as scaled_loss:
+                    #     scaled_loss.backward()
                 else:
                     loss.backward()
 
@@ -215,21 +237,59 @@ class TNTTrainer(Trainer):
         return avg_loss / num_sample
 
     def compute_loss(self, data):
-        n = data.candidate_len_max[0]
-        data.y = data.y.view(-1, self.horizon, 2).cumsum(axis=1)
+        n = data.candidate_len_max[0] # 所有agent candidate lane 的采样点数量最大的
+        data.y = data.y.view(-1, self.horizon, 2).cumsum(axis=1) # [bs,30,2]data.y 未来30帧的速度向量 (batch_sample_num,agent_traj_fut,2)->(64,30,2)
         pred, aux_out, aux_gt = self.model(data)
 
         gt = {
-            "target_prob": data.candidate_gt.view(-1, n),
+            "target_prob": data.candidate_gt.view(-1, n), # (bs, max_cand)
             "offset": data.offset_gt.view(-1, 2),
-            "y": data.y.view(-1, self.horizon * 2)
+            "y": data.y.view(-1, self.horizon * 2) #(bs, 60)
         }
 
         return self.criterion(pred, gt, aux_out, aux_gt)
 
+    def test_latency(self):
+        """
+        test the testset,
+        :param miss_threshold: float, the threshold for the miss rate, default 2.0m
+        :param compute_metric: bool, whether compute the metric
+        :param convert_coordinate: bool, True: under original coordinate, False: under the relative coordinate
+        :param save_pred: store the prediction or not, store in the Argoverse benchmark format
+        """
+        self.model.eval()
+
+
+        # k = self.model.k if not self.multi_gpu else self.model.module.k
+        k = self.model.k
+        # horizon = self.model.horizon if not self.multi_gpu else self.model.module.horizon
+        horizon = self.model.horizon
+
+        with torch.no_grad():
+            print(len(self.test_loader))
+            # print(len(self.test_dataset))
+            times = torch.zeros(len(self.test_loader))
+            for idx, data in tqdm(enumerate(self.test_loader)):
+                # inference and transform dimension
+                if self.multi_gpu:
+                    out = self.model.module(data.to(self.device))
+                    # out = self.model.inference(data.to(self.device))
+                else:
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter()
+                    out = self.model.inference(data.to(self.device))
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter()
+                    times[idx] = end_time - start_time
+        print(times)
+        print(times.mean(-1))
+
+
+
+
     def test(self,
              miss_threshold=2.0,
-             compute_metric=False,
+             compute_metric=True,
              convert_coordinate=False,
              plot=False,
              save_pred=False):
@@ -248,6 +308,7 @@ class TNTTrainer(Trainer):
         k = self.model.k
         # horizon = self.model.horizon if not self.multi_gpu else self.model.module.horizon
         horizon = self.model.horizon
+        print("test horizon:",horizon)
 
         # debug
         out_dict = {}
@@ -309,10 +370,10 @@ class TNTTrainer(Trainer):
                 ax.clear()
 
         # todo: save the output in argoverse format
-        if save_pred:
-            for key in forecasted_trajectories.keys():
-                forecasted_trajectories[key] = np.asarray(forecasted_trajectories[key])
-            generate_forecasting_h5(forecasted_trajectories, self.save_folder)
+        # if save_pred:
+        #     for key in forecasted_trajectories.keys():
+        #         forecasted_trajectories[key] = np.asarray(forecasted_trajectories[key])
+        #     generate_forecasting_h5(forecasted_trajectories, self.save_folder)
 
     # function to convert the coordinates of trajectories from relative to world
     def convert_coord(self, traj, orig, rot):

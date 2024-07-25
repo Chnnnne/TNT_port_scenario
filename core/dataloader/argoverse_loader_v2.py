@@ -19,7 +19,8 @@ sys.path.append("core/dataloader")
 def get_fc_edge_index(node_indices):
     """
     node_indices: np.array([indices]), the indices of nodes connecting with each other;
-    return a tensor(2, edges), indicing edge_index
+    return a tensor(2, edges), indicing edge_index 
+    edges = len(node_indices)**2
     """
     xx, yy = np.meshgrid(node_indices, node_indices)
     xy = np.vstack(([xx.reshape(-1), yy.reshape(-1)])).astype(np.int64)
@@ -58,13 +59,13 @@ class GraphData(Data):
 # dataset loader which loads data into memory
 class ArgoverseInMem(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
-        super(ArgoverseInMem, self).__init__(root, transform, pre_transform)
+        super(ArgoverseInMem, self).__init__(root, transform, pre_transform) # 如果没有生成pt文件的话，这里会调用process并生成pt文件存放在processed_paths下
         self.data, self.slices = torch.load(self.processed_paths[0])
         gc.collect()
 
     @property
     def raw_file_names(self):
-        return [file for file in os.listdir(self.raw_dir) if "features" in file and file.endswith(".pkl")]
+        return [file for file in os.listdir(self.raw_dir) if ("features" in file or "howo" in file) and file.endswith(".pkl")]
 
     @property
     def processed_file_names(self):
@@ -80,17 +81,17 @@ class ArgoverseInMem(InMemoryDataset):
         valid_lens = []
         candidate_lens = []
         for raw_path in tqdm(self.raw_paths, desc="Loading Raw Data..."):
-            raw_data = pd.read_pickle(raw_path)
+            raw_data = pd.read_pickle(raw_path) # 此df只有一行
 
             # statistics
-            traj_num = raw_data['feats'].values[0].shape[0]
-            traj_lens.append(traj_num)
+            traj_num = raw_data['feats'].values[0].shape[0] # all_obj
+            traj_lens.append(traj_num) # feats  (object_num,20,3) obs轨迹以及 1.0？ 此处记录的是该pkl对应的obj数量
 
-            lane_num = raw_data['graph'].values[0]['lane_idcs'].max() + 1
-            valid_lens.append(traj_num + lane_num)
+            lane_num = raw_data['graph'].values[0]['lane_idcs'].max() + 1 # # 表示属于哪个lane（sum seg_num)）
+            valid_lens.append(traj_num + lane_num)  # 统计每个csv(pkl)数据的总obj轨迹num和seg num之和
 
-            candidate_num = raw_data['tar_candts'].values[0].shape[0]
-            candidate_lens.append(candidate_num)
+            candidate_num = raw_data['tar_candts'].values[0].shape[0] # （cand_num,2)
+            candidate_lens.append(candidate_num) # 统计每个csv根据候选轨迹确定的采样点数量
         num_valid_len_max = np.max(valid_lens)
         num_candidate_max = np.max(candidate_lens)
         print("\n[Argoverse]: The maximum of valid length is {}.".format(num_valid_len_max))
@@ -111,11 +112,11 @@ class ArgoverseInMem(InMemoryDataset):
                 edge_index=torch.from_numpy(edge_index).long(),
                 identifier=torch.from_numpy(identifier).float(),    # the identify embedding of global graph completion
 
-                traj_len=torch.tensor([traj_lens[ind]]).int(),            # number of traj polyline
-                valid_len=torch.tensor([valid_lens[ind]]).int(),          # number of valid polyline
-                time_step_len=torch.tensor([num_valid_len_max]).int(),    # the maximum of no. of polyline
+                traj_len=torch.tensor([traj_lens[ind]]).int(),            # number of traj polyline  该pkl csv对应的obj_num
+                valid_len=torch.tensor([valid_lens[ind]]).int(),          # number of valid polyline   该pkl csv对应的总obj轨迹num和seg num之和
+                time_step_len=torch.tensor([num_valid_len_max]).int(),    # the maximum of no. of polyline 所有pkl csv中最大的valid_len num
 
-                candidate_len_max=torch.tensor([num_candidate_max]).int(),
+                candidate_len_max=torch.tensor([num_candidate_max]).int(), # 所有csv中根据candidate lane得到的最多的采样点数量
                 candidate_mask=[],
                 candidate=torch.from_numpy(raw_data['tar_candts'].values[0]).float(),
                 candidate_gt=torch.from_numpy(raw_data['gt_candts'].values[0]).bool(),
@@ -128,28 +129,28 @@ class ArgoverseInMem(InMemoryDataset):
             )
             data_list.append(graph_input)
 
-        data, slices = self.collate(data_list)
+        data, slices = self.collate(data_list) # data class:Data  ,是所有raw_path加在一起所有数据，用slices:dict区分
         torch.save((data, slices), self.processed_paths[0])
 
     def get(self, idx):
         data = super(ArgoverseInMem, self).get(idx).clone()
 
-        feature_len = data.x.shape[1]
-        index_to_pad = data.time_step_len[0].item()
-        valid_len = data.valid_len[0].item()
+        feature_len = data.x.shape[1] # 10
+        index_to_pad = data.time_step_len[0].item() # 该pkl中最大的valiad_len
+        valid_len = data.valid_len[0].item() # 该csv实际obj_num+seg_num之和
 
         # pad feature with zero nodes
-        data.x = torch.cat([data.x, torch.zeros((index_to_pad - valid_len, feature_len), dtype=data.x.dtype)])
-        data.cluster = torch.cat([data.cluster, torch.arange(valid_len, index_to_pad, dtype=data.cluster.dtype)]).long()
-        data.identifier = torch.cat([data.identifier, torch.zeros((index_to_pad - valid_len, 2), dtype=data.identifier.dtype)])
+        data.x = torch.cat([data.x, torch.zeros((index_to_pad - valid_len, feature_len), dtype=data.x.dtype)]) # (index_to_pad, 10)
+        data.cluster = torch.cat([data.cluster, torch.arange(valid_len, index_to_pad, dtype=data.cluster.dtype)]).long() # (index_to_pad)
+        data.identifier = torch.cat([data.identifier, torch.zeros((index_to_pad - valid_len, 2), dtype=data.identifier.dtype)]) # (index_to_pad,2)
 
         # pad candidate and candidate_gt
         num_cand_max = data.candidate_len_max[0].item()
         data.candidate_mask = torch.cat([torch.ones((len(data.candidate), 1)),
-                                         torch.zeros((num_cand_max - len(data.candidate), 1))])
-        data.candidate = torch.cat([data.candidate[:, :2], torch.zeros((num_cand_max - len(data.candidate), 2))])
+                                         torch.zeros((num_cand_max - len(data.candidate), 1))])# (num_cand_max,1)
+        data.candidate = torch.cat([data.candidate[:, :2], torch.zeros((num_cand_max - len(data.candidate), 2))]) ## (num_cand_max,2)
         data.candidate_gt = torch.cat([data.candidate_gt,
-                                       torch.zeros((num_cand_max - len(data.candidate_gt), 1), dtype=data.candidate_gt.dtype)])
+                                       torch.zeros((num_cand_max - len(data.candidate_gt), 1), dtype=data.candidate_gt.dtype)])# (num_cand_max,1)
 
         assert data.cluster.shape[0] == data.x.shape[0], "[ERROR]: Loader error!"
 
@@ -172,50 +173,56 @@ class ArgoverseInMem(InMemoryDataset):
         identifier = np.empty((0, 2))
 
         # get traj features
-        traj_feats = data_seq['feats'].values[0]
-        traj_has_obss = data_seq['has_obss'].values[0]
-        step = np.arange(0, traj_feats.shape[1]).reshape((-1, 1))
-        traj_cnt = 0
-        for _, [feat, has_obs] in enumerate(zip(traj_feats, traj_has_obss)):
-            xy_s = feat[has_obs][:-1, :2]
-            vec = feat[has_obs][1:, :2] - feat[has_obs][:-1, :2]
-            traffic_ctrl = np.zeros((len(xy_s), 1))
-            is_intersect = np.zeros((len(xy_s), 1))
-            is_turn = np.zeros((len(xy_s), 2))
-            polyline_id = np.ones((len(xy_s), 1)) * traj_cnt
-            feats = np.vstack([feats, np.hstack([xy_s, vec, step[has_obs][:-1], traffic_ctrl, is_turn, is_intersect, polyline_id])])
+        traj_feats = data_seq['feats'].values[0]  # (all_obj_num,20,3) obs轨迹以及 1.0？
+        traj_has_obss = data_seq['has_obss'].values[0] # (all_obj_num, 20)  标志20帧中的有效帧
+        step = np.arange(0, traj_feats.shape[1]).reshape((-1, 1))#(20,1)
+        traj_cnt = 0 # obj num
+        for _, [feat, has_obs] in enumerate(zip(traj_feats, traj_has_obss)): # 遍历每个obj的历史traj
+            xy_s = feat[has_obs][:-1, :2] # [20,3][20]-> [v,3] ->[v-1,2]
+            vec = feat[has_obs][1:, :2] - feat[has_obs][:-1, :2] # #(v-1,2)
+            traffic_ctrl = np.zeros((len(xy_s), 1)) #(v-1,1)
+            is_intersect = np.zeros((len(xy_s), 1)) #(v-1,1)
+            is_turn = np.zeros((len(xy_s), 2)) #(v-1,2)
+            polyline_id = np.ones((len(xy_s), 1)) * traj_cnt #(v-1,1) 代表属于哪一个object
+            # feats  hsatck->[v-1,2+2+1+1+1+2+1=10] -> vstack ->[..+v-1,10] -> [all_traj_all_obs, 10]
+            feats = np.vstack([feats, np.hstack([xy_s, vec, step[has_obs][:-1], traffic_ctrl, is_turn, is_intersect, polyline_id])]) 
             traj_cnt += 1
 
         # get lane features
         graph = data_seq['graph'].values[0]
-        ctrs = graph['ctrs']
-        vec = graph['feats']
-        traffic_ctrl = graph['control'].reshape(-1, 1)
-        is_turns = graph['turn']
-        is_intersect = graph['intersect'].reshape(-1, 1)
-        lane_idcs = graph['lane_idcs'].reshape(-1, 1) + traj_cnt
+        ctrs = graph['ctrs'] # 每条lane的每个seg的二阶中点的[all_lane_num*9, 2]
+        vec = graph['feats'] # 每条lane的每个seg的方向向量 [all_lane_num*9,2]
+        traffic_ctrl = graph['control'].reshape(-1, 1) # 每个seg的has_traffic_control[all_lane_num*9,1]
+        is_turns = graph['turn']# 每条lane的每个seg的转向标志[all_lane_num*9,2]
+        is_intersect = graph['intersect'].reshape(-1, 1) # [all_lane_num*9,1]
+        lane_idcs = graph['lane_idcs'].reshape(-1, 1) + traj_cnt # [all_lane_num*9,1]
         steps = np.zeros((len(lane_idcs), 1))
+        # (all_traj_all_point_obs+all_lane_num*9, 10)
         feats = np.vstack([feats, np.hstack([ctrs, vec, steps, traffic_ctrl, is_turns, is_intersect, lane_idcs])])
 
         # get the cluster and construct subgraph edge_index
-        cluster = copy(feats[:, -1].astype(np.int64))
+        cluster = copy(feats[:, -1].astype(np.int64)) # (1689,) 标志属于哪一个lane或者obj_traj
         for cluster_idc in np.unique(cluster):
-            [indices] = np.where(cluster == cluster_idc)
-            identifier = np.vstack([identifier, np.min(feats[indices, :2], axis=0)])
+            [indices] = np.where(cluster == cluster_idc) # indices表示cluster_idx代表的lane的索引序列
+            identifier = np.vstack([identifier, np.min(feats[indices, :2], axis=0)]) #每个lane或者obj_traj 最小的轨迹xy
             if len(indices) <= 1:
                 continue                # skip if only 1 node
             if cluster_idc < traj_cnt:
-                edge_index = np.hstack([edge_index, get_fc_edge_index(indices)])
+                edge_index = np.hstack([edge_index, get_fc_edge_index(indices)]) # 一个lane或者一个obj_traj为一个cluster，这里将每个clusetr内部的数据点都建立全连接的idx
             else:
                 edge_index = np.hstack([edge_index, get_fc_edge_index(indices)])
         return feats, cluster, edge_index, identifier
+        # feats (obejct_len_sum + seg_num_sum, 10)
+        # cluster (obejct_len_sum + seg_num_sum)标识哪个属于obj_lane和seg
+        # edge_index(2,sum object_len**2 + seg_lane**2)
+        # identifier (obejct_len_sum + seg_num_sum, 2) 每个obj_traj或者lane的最小xy
 
     @staticmethod
     def _get_y(data_seq):
-        traj_obs = data_seq['feats'].values[0][0]
-        traj_fut = data_seq['gt_preds'].values[0][0]
-        offset_fut = np.vstack([traj_fut[0, :] - traj_obs[-1, :2], traj_fut[1:, :] - traj_fut[:-1, :]])
-        return offset_fut.reshape(-1).astype(np.float32)
+        traj_obs = data_seq['feats'].values[0][0] # [all_obj_num,20,3]->[20,3]  agent前20帧轨迹
+        traj_fut = data_seq['gt_preds'].values[0][0] #[all_obj_num,30,2]-> [30,2]    agent后续30帧的真实轨迹
+        offset_fut = np.vstack([traj_fut[0, :] - traj_obs[-1, :2], traj_fut[1:, :] - traj_fut[:-1, :]]) # [1,2]+[49,2] -> [50,2]
+        return offset_fut.reshape(-1).astype(np.float32) # 未来30帧的速度向量（30,2)->(60)
 
 
 # dataset loader which loads data into memory

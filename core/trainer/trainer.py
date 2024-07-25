@@ -3,7 +3,7 @@
 import os
 from tqdm import tqdm
 
-import json
+import json,math
 
 import torch
 
@@ -196,7 +196,7 @@ class Trainer(object):
         if self.verbose:
             print("[Trainer]: Saving checkpoint to {}...".format(self.save_folder))
 
-    def save_model(self, prefix=""):
+    def save_model(self, form, epoch, prefix=""):
         """
         save current state of the model
         :param prefix: str, the prefix to the model file
@@ -209,33 +209,42 @@ class Trainer(object):
             os.makedirs(self.save_folder, exist_ok=True)
 
         # compute the metrics and save
-        metric = self.compute_metric()
+        if form == "tnt":
+            metric_k, metric_1 = self.compute_metric_tnt()
+        else:
+            metric_k = self.compute_metric_vn()
+
+        metric_stored_file = os.path.join(self.save_folder, "{}_metrics.txt".format(prefix))
+        with open(metric_stored_file, 'a+') as f:
+            f.write(f"epoch:{epoch}, "+json.dumps(metric_k))
+            f.write("\n")
+            if form =="tnt":
+                f.write(f"epoch:{epoch}, "+json.dumps(metric_1))
+                f.write("\n\n")
 
         # skip model saving if the minADE is not better
-        if self.best_metric and isinstance(metric, dict):
-            if metric["minADE"] >= self.best_metric["minADE"]:
-                print("[Trainer]: Best minADE: {}; Current minADE: {}; Skip model saving...".format(
+        if self.best_metric and isinstance(metric_k, dict):
+            if metric_k["minADE"] >= self.best_metric["minADE"]:
+                print("[Trainer]: Best minADE: {}; Current minADE: {}; all metric:{}; Skip model saving...".format(
                     self.best_metric["minADE"],
-                    metric["minADE"]))
+                    metric_k["minADE"],
+                    metric_k))
                 return
 
         # save best metric
         if self.verbose:
-            print("[Trainer]: Best minADE: {}; Current minADE: {}; Saving model to {}...".format(
+            print("[Trainer]: Best minADE: {}; Current minADE: {}; all metric:{}; Saving model to {}...".format(
                 self.best_metric["minADE"] if self.best_metric else "Inf",
-                metric["minADE"],
+                metric_k["minADE"],
+                metric_k,
                 self.save_folder))
-        self.best_metric = metric
-        metric_stored_file = os.path.join(self.save_folder, "{}_metrics.txt".format(prefix))
-        with open(metric_stored_file, 'a+') as f:
-            f.write(json.dumps(self.best_metric))
-            f.write("\n")
+        self.best_metric = metric_k
 
         # save model
         torch.save(
             self.model.state_dict() if not self.multi_gpu else self.model.module.state_dict(),
             # self.model.state_dict(),
-            os.path.join(self.save_folder, "{}_{}.pth".format(prefix, type(self.model).__name__))
+            os.path.join(self.save_folder, "{}_{}_{}.pth".format(prefix, type(self.model).__name__, epoch))
         )
 
     def load(self, load_path, mode='c'):
@@ -262,7 +271,82 @@ class Trainer(object):
         else:
             raise NotImplementedError
 
-    def compute_metric(self, miss_threshold=2.0):
+    def compute_metric_tnt(self, miss_threshold=3):
+        """
+        compute metric for test dataset
+        :param miss_threshold: float,
+        :return:
+        """
+        assert self.model, "[Trainer]: No valid model, metrics can't be computed!"
+        assert self.testset, "[Trainer]: No test dataset, metrics can't be computed!"
+
+        forecasted_trajectories, gt_trajectories,forecasted_prob = {}, {}, {}
+        seq_id = 0
+
+        # k = self.model.k if not self.multi_gpu else self.model.module.k
+        # horizon = self.model.horizon if not self.multi_gpu else self.model.module.horizon
+        k = self.model.k if not self.multi_gpu else self.model.module.k
+        horizon = self.model.horizon if not self.multi_gpu else self.model.module.horizon
+
+        self.model.eval()
+        iter_num, mink_ahe, min1_ahe, mink_fhe, min1_fhe= 0, 0.0, 0.0, 0.0, 0.0
+        with torch.no_grad():
+            for data in tqdm(self.test_loader):
+
+                batch_size = data.num_graphs
+                gt = data.y.unsqueeze(1).view(batch_size, -1, 2).cumsum(axis=1).numpy() # [bs,50,2]
+
+                # inference and transform dimension
+                if self.multi_gpu:
+                    out = self.model.module.inference(data.to(self.device))
+                else:
+                    out = self.model.inference(data.to(self.device)) 
+                pred_y, pred_y_prob = out# [bs,k,50,2] [bs,k]
+                mink_ahe += get_minK_ahe(pred_y, torch.from_numpy(gt).unsqueeze(1).to('cuda')) # S,K,50,2    S,1,50,2    -> 1   [bs,k,50,2] [bs,1,50,2] -> 1
+                min1_ahe += get_minK_ahe(pred_y[:,0].unsqueeze(1), torch.from_numpy(gt).unsqueeze(1).to('cuda'))
+                mink_fhe += get_minK_fhe(pred_y, torch.from_numpy(gt).unsqueeze(1).to('cuda'))
+                min1_fhe += get_minK_fhe(pred_y[:,0].unsqueeze(1), torch.from_numpy(gt).unsqueeze(1).to('cuda'))
+                iter_num += 1
+                pred_y_prob = pred_y_prob.cpu().numpy()
+                pred_y = pred_y.cpu().numpy()
+
+                # record the prediction and ground truth
+                for batch_id in range(batch_size):
+                    forecasted_trajectories[seq_id] = [pred_y_k for pred_y_k in pred_y[batch_id]] # [bs,k,50,2] -> key=id,val=list k[50,2]
+                    gt_trajectories[seq_id] = gt[batch_id]
+                    forecasted_prob[seq_id] = [pred_y_k_prob for pred_y_k_prob in pred_y_prob[batch_id]]
+                    seq_id += 1
+
+
+            metric_results_k = get_displacement_errors_and_miss_rate(
+                forecasted_trajectories,
+                gt_trajectories,
+                k,
+                horizon,
+                miss_threshold,
+                forecasted_probabilities=forecasted_prob
+            )
+            metric_results_1 = get_displacement_errors_and_miss_rate(
+                forecasted_trajectories,
+                gt_trajectories,
+                1,
+                horizon,
+                miss_threshold,
+                forecasted_probabilities=forecasted_prob
+            )
+            mink_ahe = mink_ahe/ iter_num
+            min1_ahe = min1_ahe/ iter_num
+            mink_fhe = mink_fhe/ iter_num
+            min1_fhe = min1_fhe/ iter_num
+            metric_results_k['mink_ahe'] = mink_ahe.item()
+            metric_results_k['mink_fhe'] = mink_fhe.item()
+            metric_results_1['min1_ahe'] = min1_ahe.item()
+            metric_results_1['min1_fhe'] = min1_fhe.item()
+
+
+        return metric_results_k, metric_results_1
+    
+    def compute_metric_vn(self, miss_threshold=2.5):
         """
         compute metric for test dataset
         :param miss_threshold: float,
@@ -280,17 +364,22 @@ class Trainer(object):
         horizon = self.model.horizon if not self.multi_gpu else self.model.module.horizon
 
         self.model.eval()
+        iter_num,min1_ahe, min1_fhe= 0, 0.0, 0.0
         with torch.no_grad():
             for data in tqdm(self.test_loader):
                 batch_size = data.num_graphs
-                gt = data.y.unsqueeze(1).view(batch_size, -1, 2).cumsum(axis=1).numpy()
+                gt = data.y.unsqueeze(1).view(batch_size, -1, 2).cumsum(axis=1).numpy()# [bs,50,2]
 
                 # inference and transform dimension
                 if self.multi_gpu:
                     out = self.model.module.inference(data.to(self.device))
                 else:
                     out = self.model.inference(data.to(self.device))
-                pred_y = out.cpu().numpy()
+                pred_y = out# bs,1,50,2
+                min1_ahe += get_minK_ahe(pred_y, torch.from_numpy(gt).unsqueeze(1).to('cuda')) #[bs,k1,50,2] [bs,1,50,2] -> 1
+                min1_fhe += get_minK_fhe(pred_y, torch.from_numpy(gt).unsqueeze(1).to('cuda')) # 1
+                iter_num += 1
+                pred_y = pred_y.cpu().numpy()
 
                 # record the prediction and ground truth
                 for batch_id in range(batch_size):
@@ -305,4 +394,60 @@ class Trainer(object):
                 horizon,
                 miss_threshold
             )
+            min1_ahe = min1_ahe/ iter_num
+            min1_fhe = min1_fhe/ iter_num
+            metric_results['min1_ahe'] = min1_ahe.item()
+            metric_results['min1_fhe'] = min1_fhe.item()
         return metric_results
+
+
+
+def get_minK_ahe(proposed_traj,gt_traj):
+    '''
+    input:
+        - proposed_traj B,W不定,50,2
+        - gt_traj B,1,50,2
+    return 
+        - ahe B,W,49 - B,1,49  -> B,W,49 -> B,W -> B -> sum
+    '''  
+    traj_yaw = get_yaw(proposed_traj) # B,W,49
+    gt_yaw = get_yaw(gt_traj) # B,1,49
+    yaw_diff = torch.abs(principal_value(traj_yaw - gt_yaw)).mean(-1).min(dim=-1).values.mean(-1) 
+    return yaw_diff
+
+def get_minK_fhe(proposed_traj, gt_traj):
+    '''
+    input:
+        - proposed_traj B,W不定,50,2
+        - gt_traj B,1,50,2
+    return:
+        - afe:B    B,W,49 - B,1,49  -> B,W,49, -> B,W -> B -> sum
+
+    '''  
+    traj_yaw = get_yaw(proposed_traj) # B,W,49
+    gt_yaw = get_yaw(gt_traj) # B,1,49
+    yaw_diff = torch.abs(principal_value(traj_yaw - gt_yaw))[...,-1].min(dim=-1).values.mean(-1) 
+    return yaw_diff
+
+def principal_value(angle, min_= -math.pi):
+    """
+    Wrap heading angle in to specified domain (multiples of 2 pi alias),
+    ensuring that the angle is between min_ and min_ + 2 pi. This function raises an error if the angle is infinite
+    :param angle: rad
+    :param min_: minimum domain for angle (rad)
+    :return angle wrapped to [min_, min_ + 2 pi).
+    S,N,49
+    """
+    assert torch.all(torch.isfinite(angle)), "angle is not finite"
+
+    lhs = (angle - min_) % (2 * math.pi) + min_
+
+    return lhs
+
+def get_yaw(traj):
+    '''
+    traj:B,N,T,2 B个agent N条轨迹
+    '''
+    vec_vector = torch.diff(traj, dim=-2) #  B,N,T-1,2
+    yaw = torch.atan2(vec_vector[...,1],vec_vector[...,0]) # B,N,T-1
+    return yaw

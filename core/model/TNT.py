@@ -21,19 +21,19 @@ from core.dataloader.argoverse_loader_v2 import GraphData, ArgoverseInMem
 class TNT(nn.Module):
     def __init__(self,
                  in_channels=8,
-                 horizon=30,
+                 horizon=50,
                  num_subgraph_layers=3,
-                 num_global_graph_layer=1,
-                 subgraph_width=64,
-                 global_graph_width=64,
+                 num_global_graph_layer=4,
+                 subgraph_width=128,
+                 global_graph_width=128,
                  with_aux=False,
-                 aux_width=64,
-                 target_pred_hid=64,
+                 aux_width=128,
+                 target_pred_hid=128,
                  m=50,
-                 motion_esti_hid=64,
+                 motion_esti_hid=128,
                  score_sel_hid=64,
                  temperature=0.01,
-                 k=6,
+                 k=5,
                  device=torch.device("cpu")
                  ):
         """
@@ -112,38 +112,39 @@ class TNT(nn.Module):
                         "score":        the predicted score for each predicted trajectory,
                      }
         """
-        n = int(data.candidate_len_max[0].cpu().numpy())
+        n = int(data.candidate_len_max[0].cpu().numpy()) # 所有csv中最多的采样点数量
 
-        target_candidate = data.candidate.view(-1, n, 2)   # [batch_size, N, 2]
+        target_candidate = data.candidate.view(-1, n, 2)   # [bs, max_cand, 2] 
         batch_size, _, _ = target_candidate.size()
-        candidate_mask = data.candidate_mask.view(-1, n)
+        candidate_mask = data.candidate_mask.view(-1, n) # [bs, max_cand]
 
         # feature encoding
-        global_feat, aux_out, aux_gt = self.backbone(data)             # [batch_size, time_step_len, global_graph_width]
-        target_feat = global_feat[:, 0].unsqueeze(1)
+        global_feat, aux_out, aux_gt = self.backbone(data)# global_feat[bs, time_step_len, global_graph_width] time_s_l是pad之后的obj_num+seg_num
+        target_feat = global_feat[:, 0].unsqueeze(1) # [bs,1,feat_channels][64,1,64] 取batch中每个sample的agent项 
 
-        # predict prob. for each target candidate, and corresponding offest
-        target_prob, offset = self.target_pred_layer(target_feat, target_candidate, candidate_mask)
+        # 1.cand打分并生成offset。predict prob. for each target candidate, and corresponding offest
+        # [bx,max_cand],[bs,max_cand,2] <-          [bs,1,D]+[bs,max_cand,2]+[bs,max_cand]
+        target_prob, offset = self.target_pred_layer(target_feat, target_candidate, candidate_mask) 
 
-        # predict the trajectory given the target gt
-        target_gt = data.target_gt.view(-1, 1, 2)
-        traj_with_gt = self.motion_estimator(target_feat, target_gt)
+        # 2. 轨迹生成。predict the trajectory given the target gt (Teacher Forcing，这里的target gt就是真实agent 的最终点)
+        target_gt = data.target_gt.view(-1, 1, 2) # [bs*2] -> [bs, 1, 2]
+        traj_with_gt = self.motion_estimator(target_feat, target_gt) # [bs,1,D]+[bs,1,2]-> ->[bs,1,horizon*2]
 
-        # predict the trajectories for the M most-likely predicted target, and the score
-        _, indices = target_prob.topk(self.m, dim=1)
-        batch_idx = torch.vstack([torch.arange(0, batch_size, device=self.device) for _ in range(self.m)]).T
-        target_pred_se, offset_pred_se = target_candidate[batch_idx, indices], offset[batch_idx, indices]
+        # 3. 轨迹打分。predict the trajectories for the M most-likely predicted target, and the score
+        _, indices = target_prob.topk(self.m, dim=1)# [bx,max_cand] -> [bs, 50] 
+        batch_idx = torch.vstack([torch.arange(0, batch_size, device=self.device) for _ in range(self.m)]).T # ->(bs, 50)
+        target_pred_se, offset_pred_se = target_candidate[batch_idx, indices], offset[batch_idx, indices] # [bs,50,2] [bs,50,2] <-[bs,max_cand,2][(bs,50),(bs, 50)]
 
-        trajs = self.motion_estimator(target_feat, target_pred_se + offset_pred_se)
+        trajs = self.motion_estimator(target_feat, target_pred_se + offset_pred_se)# [bs, 50, 60]<-[bs,1,D]+[bs,50,2] # 每个candiadate都算出一个轨迹
 
-        score = self.traj_score_layer(target_feat, trajs)
+        score = self.traj_score_layer(target_feat, trajs)# [bs, 50] <- [bs,1,D] + [bs,50,60]
 
         return {
-            "target_prob": target_prob,
-            "offset": offset,
-            "traj_with_gt": traj_with_gt,
-            "traj": trajs,
-            "score": score
+            "target_prob": target_prob, # [bx,max_cand]
+            "offset": offset, # [bs,max_cand,2]
+            "traj_with_gt": traj_with_gt, # [bs,1,horizon*2]
+            "traj": trajs, # [bs,50,horizon*2]
+            "score": score # [bs,50]
         }, aux_out, aux_gt
 
     def inference(self, data):
@@ -156,7 +157,7 @@ class TNT(nn.Module):
         target_candidate = data.candidate.view(-1, n, 2)    # [batch_size, N, 2]
         batch_size, _, _ = target_candidate.size()
 
-        global_feat, _, _ = self.backbone(data)     # [batch_size, time_step_len, global_graph_width]
+        global_feat, _, _ = self.backbone(data)     # [batch_size, time_step_len, global_graph_width=feature]
         target_feat = global_feat[:, 0].unsqueeze(1)
 
         # predict the prob. of target candidates and selected the most likely M candidate
@@ -172,9 +173,9 @@ class TNT(nn.Module):
         traj_pred = self.motion_estimator(target_feat, target_pred_se + offset_pred_se)
 
         # score the predicted trajectory and select the top k trajectory
-        score = self.traj_score_layer(target_feat, traj_pred)
-
-        return self.traj_selection(traj_pred, score).view(batch_size, self.k, self.horizon, 2)
+        score = self.traj_score_layer(target_feat, traj_pred) # [bs,m,100] -> [bs,m]
+        score_sort = score.topk(self.k, dim=-1).values # [bs,k]
+        return self.traj_selection(traj_pred, score).view(batch_size, self.k, self.horizon, 2),score_sort # [bs,k,50,2]
 
     def candidate_sampling(self, data):
         """
@@ -239,7 +240,7 @@ if __name__ == "__main__":
     data_iter = DataLoader(dataset, batch_size=batch_size, num_workers=1, pin_memory=True)
 
     m, k = 50, 6
-    pred_len = 30
+    pred_len = 50
 
     # device = torch.device("cuda:1")
     device = torch.device("cpu")

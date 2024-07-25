@@ -1,1 +1,12 @@
 *.csv
+*.pkl
+*.pyc
+__pycache__/
+*.whl
+*.png
+*.jpg
+*.DS_Store
+*.pt
+my_demo
+run/tnt
+*.*.pyc
